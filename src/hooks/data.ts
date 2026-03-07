@@ -1,5 +1,14 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api, type Channel, type Post, type Agent, type Mention } from '../api/hive';
+
+// Progress message from SSE task.progress events
+export interface ProgressMessage {
+  id: string;
+  agentId: string;
+  channelId: string;
+  content: string;
+  timestamp: number;
+}
 
 // Channels hook
 export function useChannels() {
@@ -149,5 +158,62 @@ export function useChannel(channelId: string | null) {
     posts,
     loading: postsLoading || channelsLoading,
     refetchPosts,
+  };
+}
+
+// Hook for managing streaming progress messages
+export function useProgress(channelId: string | null) {
+  const [progressMessages, setProgressMessages] = useState<ProgressMessage[]>([]);
+  const [streamingAgentId, setStreamingAgentId] = useState<string | null>(null);
+  const accumulatedRef = useRef<Map<string, string>>(new Map());
+
+  // Add a progress chunk from SSE
+  const addProgress = (event: { agentId: string; channelId: string; chunk: string }) => {
+    if (!channelId || event.channelId !== channelId) return;
+    
+    // Accumulate chunks for this agent
+    const existing = accumulatedRef.current.get(event.agentId) || '';
+    accumulatedRef.current.set(event.agentId, existing + event.chunk);
+    
+    setStreamingAgentId(event.agentId);
+    
+    // Update progress message with accumulated content
+    setProgressMessages(prev => {
+      const filtered = prev.filter(p => p.agentId !== event.agentId);
+      return [...filtered, {
+        id: `progress-${event.agentId}`,
+        agentId: event.agentId,
+        channelId: event.channelId,
+        content: accumulatedRef.current.get(event.agentId) || '',
+        timestamp: Date.now(),
+      }];
+    });
+  };
+
+  // Clear progress (when agent completes or fails)
+  const clearProgress = (agentId?: string) => {
+    if (agentId) {
+      accumulatedRef.current.delete(agentId);
+      setProgressMessages(prev => prev.filter(p => p.agentId !== agentId));
+      setStreamingAgentId(prev => prev === agentId ? null : prev);
+    } else {
+      accumulatedRef.current.clear();
+      setProgressMessages([]);
+      setStreamingAgentId(null);
+    }
+  };
+
+  // Clear progress when switching channels
+  useEffect(() => {
+    accumulatedRef.current.clear();
+    setProgressMessages([]);
+    setStreamingAgentId(null);
+  }, [channelId]);
+
+  return {
+    progressMessages,
+    streamingAgentId,
+    addProgress,
+    clearProgress,
   };
 }
