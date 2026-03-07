@@ -697,3 +697,65 @@ body {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* Sidebar section with badge */
+.sidebar-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-section-title .badge {
+  font-size: 10px;
+  min-width: 16px;
+  height: 16px;
+}
+
+/* Spinning animation */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spin {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+/* Task item in sidebar */
+.task-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background 0.15s ease;
+}
+
+.task-item:hover {
+  background: var(--bg-hover);
+}
+
+.task-item.running {
+  color: var(--warning);
+}
+
+.task-item.pending {
+  color: var(--text-muted);
+}
+
+.task-item-status {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+}
+
+.task-item-agent {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}

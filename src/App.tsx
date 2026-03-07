@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { useChannels, useAgents, useChannel, useSSE } from './hooks/data';
+import { useChannels, useAgents, useChannel, useSSE, useMentions } from './hooks/data';
 import { api, type Post } from './api/hive';
 import './styles.css';
 
@@ -48,10 +48,40 @@ function MentionAutocomplete({
   );
 }
 
+// Active tasks sidebar section
+function ActiveTasks({ mentions }: { mentions: ReturnType<typeof useMentions>['mentions'] }) {
+  const running = mentions.filter(m => m.spawnStatus === 'running');
+  const pending = mentions.filter(m => m.spawnStatus === 'pending');
+  const recent = [...running, ...pending].slice(0, 5);
+
+  if (recent.length === 0) return null;
+
+  return (
+    <div className="sidebar-section">
+      <div className="sidebar-section-title">
+        Active Tasks
+        {running.length > 0 && <span className="badge">{running.length}</span>}
+      </div>
+      {recent.map(mention => (
+        <div key={mention.id} className={`task-item ${mention.spawnStatus}`}>
+          <div className="task-item-status">
+            {mention.spawnStatus === 'pending' && '○'}
+            {mention.spawnStatus === 'running' && <span className="spin">◐</span>}
+          </div>
+          <div className="task-item-info">
+            <div className="task-item-agent">@{mention.agentId}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // Main App
 export default function App() {
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const { channels, loading: channelsLoading } = useChannels();
+  const { mentions, refetch: refetchMentions } = useMentions();
   
   // Select first channel by default
   useEffect(() => {
@@ -67,8 +97,9 @@ export default function App() {
         loading={channelsLoading}
         selectedChannelId={selectedChannelId}
         onSelectChannel={setSelectedChannelId}
+        mentions={mentions}
       />
-      <Main channelId={selectedChannelId} />
+      <Main channelId={selectedChannelId} onTaskUpdate={refetchMentions} />
     </div>
   );
 }
@@ -78,14 +109,25 @@ function Sidebar({
   channels, 
   loading, 
   selectedChannelId,
-  onSelectChannel 
+  onSelectChannel,
+  mentions
 }: { 
   channels: ReturnType<typeof useChannels>['channels'];
   loading: boolean;
   selectedChannelId: string | null;
   onSelectChannel: (id: string) => void;
+  mentions: ReturnType<typeof useMentions>['mentions'];
 }) {
   const { agents, loading: agentsLoading } = useAgents();
+  
+  // Get agent IDs with running tasks
+  const runningAgentIds = useMemo(() => {
+    return new Set(
+      mentions
+        .filter(m => m.spawnStatus === 'running' || m.spawnStatus === 'pending')
+        .map(m => m.agentId)
+    );
+  }, [mentions]);
 
   return (
     <aside className="sidebar">
@@ -121,19 +163,26 @@ function Sidebar({
         {agentsLoading ? (
           <div className="sidebar-item" style={{ color: 'var(--text-muted)' }}>Loading...</div>
         ) : (
-          agents.map(agent => (
-            <div key={agent.id} className="agent-item">
-              <div className="agent-avatar">
-                {agent.id.charAt(0).toUpperCase()}
+          agents.map(agent => {
+            const isRunning = runningAgentIds.has(agent.id);
+            return (
+              <div key={agent.id} className={`agent-item ${isRunning ? 'running' : ''}`}>
+                <div className={`agent-avatar ${isRunning ? 'running' : ''}`}>
+                  {agent.id.charAt(0).toUpperCase()}
+                </div>
+                <div className="agent-item-info">
+                  <div className="agent-item-name">{agent.name}</div>
+                  <div className="agent-item-status">
+                    {isRunning ? 'running' : 'idle'}
+                  </div>
+                </div>
               </div>
-              <div className="agent-item-info">
-                <div className="agent-item-name">{agent.name}</div>
-                <div className="agent-item-status">idle</div>
-              </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
+
+      <ActiveTasks mentions={mentions} />
 
       <button 
         className="sidebar-new-channel"
@@ -151,7 +200,7 @@ function Sidebar({
 }
 
 // Main content area
-function Main({ channelId }: { channelId: string | null }) {
+function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpdate: () => void }) {
   const { channel, channels, posts, loading, refetchPosts } = useChannel(channelId);
   const { events, connected } = useSSE('/api/events/stream');
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -167,9 +216,13 @@ function Main({ channelId }: { channelId: string | null }) {
       const lastEvent = events[events.length - 1];
       if (lastEvent.type === 'task.completed' || lastEvent.type === 'task.failed') {
         refetchPosts();
+        onTaskUpdate();
+      }
+      if (lastEvent.type === 'task.started') {
+        onTaskUpdate();
       }
     }
-  }, [events, refetchPosts]);
+  }, [events, refetchPosts, onTaskUpdate]);
 
   return (
     <div className="main">
@@ -218,7 +271,7 @@ function Main({ channelId }: { channelId: string | null }) {
       </div>
 
       {channel && (
-        <Composer channelId={channel.id} onSend={refetchPosts} />
+        <Composer channelId={channel.id} onSend={() => { refetchPosts(); onTaskUpdate(); }} />
       )}
     </div>
   );
