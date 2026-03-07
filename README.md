@@ -84,13 +84,30 @@ src/
 
 ## Configuration
 
-Edit `vite.config.ts` to change the Hive API target:
+### Connecting to a Different Server
+
+**Via environment variable** (sets the dev proxy target):
+
+```bash
+HIVE_API_URL=http://remote-hive:3000 bun run dev
+```
+
+**Via the UI** — click the server bar at the top of the app to:
+- Enter a new server URL and connect
+- Switch between previously used servers (saved in localStorage)
+- Reset to the default server
+
+When a custom server is set via the UI, API requests and SSE connections go directly to that server (bypassing the Vite proxy). This works in both development and production.
+
+### Default Proxy Configuration
+
+The Vite dev server proxies `/api/*` to the Hive backend (default `http://localhost:3000`):
 
 ```typescript
 server: {
   proxy: {
     '/api': {
-      target: 'http://localhost:3000',
+      target: process.env.HIVE_API_URL || 'http://localhost:3000',
       changeOrigin: true,
       rewrite: (path) => path.replace(/^\/api/, '')
     }

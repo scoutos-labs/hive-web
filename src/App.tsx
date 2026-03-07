@@ -1,7 +1,16 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useChannels, useAgents, useChannel, useSSE, useMentions } from './hooks/data';
 import { api, type Post } from './api/hive';
 import { initNotifications, notifyAgentComplete, notifyAgentFailed } from './notifications';
+import {
+  getCurrentServer,
+  getDefaultServer,
+  getServerHistory,
+  isCustomServer,
+  switchServer,
+  clearServerOverride,
+  removeFromHistory,
+} from './server';
 import './styles.css';
 
 // Mention autocomplete component
@@ -45,6 +54,145 @@ function MentionAutocomplete({
           <span className="mention-option-id">@{agent.id}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+// Server switcher bar
+function ServerBar() {
+  const [expanded, setExpanded] = useState(false);
+  const [inputValue, setInputValue] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+
+  const currentServer = getCurrentServer();
+  const defaultServer = getDefaultServer();
+  const isOverride = isCustomServer();
+  const history = getServerHistory();
+
+  // On mount, sync the proxy target with what's saved in localStorage
+  useEffect(() => {
+    if (isOverride) {
+      fetch('/__hive__/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: currentServer }),
+      }).catch(() => {}); // ignore errors (e.g. production, no dev server)
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    if (!expanded) return;
+    const handleClick = (e: MouseEvent) => {
+      if (barRef.current && !barRef.current.contains(e.target as Node)) {
+        setExpanded(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [expanded]);
+
+  // Focus input when expanding
+  useEffect(() => {
+    if (expanded && inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [expanded]);
+
+  const handleConnect = useCallback(() => {
+    const url = inputValue.trim();
+    if (!url) return;
+    switchServer(url);
+  }, [inputValue]);
+
+  const handleReset = useCallback(() => {
+    clearServerOverride();
+    // Tell proxy to revert to default target
+    fetch('/__hive__/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: defaultServer }),
+    }).finally(() => window.location.reload());
+  }, []);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      handleConnect();
+    }
+    if (e.key === 'Escape') {
+      setExpanded(false);
+    }
+  }, [handleConnect]);
+
+  return (
+    <div className="server-bar" ref={barRef}>
+      <div className="server-bar-main" onClick={() => setExpanded(!expanded)}>
+        <span className="server-bar-label">SERVER</span>
+        <span className="server-bar-url">{currentServer}</span>
+        {isOverride && (
+          <span className="server-bar-badge">custom</span>
+        )}
+        <span className="server-bar-toggle">{expanded ? '\u25B4' : '\u25BE'}</span>
+      </div>
+
+      {expanded && (
+        <div className="server-bar-dropdown">
+          <div className="server-bar-input-row">
+            <input
+              ref={inputRef}
+              className="server-bar-input"
+              type="text"
+              placeholder="http://hostname:3000"
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={handleKeyDown}
+            />
+            <button
+              className="server-bar-connect"
+              onClick={handleConnect}
+              disabled={!inputValue.trim()}
+            >
+              Connect
+            </button>
+          </div>
+
+          {history.length > 0 && (
+            <div className="server-bar-history">
+              <div className="server-bar-history-title">Recent Servers</div>
+              {history.map(url => (
+                <div key={url} className="server-bar-history-item">
+                  <button
+                    className="server-bar-history-url"
+                    onClick={() => switchServer(url)}
+                  >
+                    {url}
+                    {url === currentServer && <span className="server-bar-active-dot" />}
+                  </button>
+                  <button
+                    className="server-bar-history-remove"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeFromHistory(url);
+                      setExpanded(false);
+                      setTimeout(() => setExpanded(true), 0);
+                    }}
+                    title="Remove from history"
+                  >
+                    x
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {isOverride && (
+            <button className="server-bar-reset" onClick={handleReset}>
+              Reset to default ({defaultServer})
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -97,15 +245,18 @@ export default function App() {
   }, [channels, selectedChannelId]);
 
   return (
-    <div className="app">
-      <Sidebar
-        channels={channels}
-        loading={channelsLoading}
-        selectedChannelId={selectedChannelId}
-        onSelectChannel={setSelectedChannelId}
-        mentions={mentions}
-      />
-      <Main channelId={selectedChannelId} onTaskUpdate={refetchMentions} />
+    <div className="app-wrapper">
+      <ServerBar />
+      <div className="app">
+        <Sidebar
+          channels={channels}
+          loading={channelsLoading}
+          selectedChannelId={selectedChannelId}
+          onSelectChannel={setSelectedChannelId}
+          mentions={mentions}
+        />
+        <Main channelId={selectedChannelId} onTaskUpdate={refetchMentions} />
+      </div>
     </div>
   );
 }
@@ -205,16 +356,169 @@ function Sidebar({
   );
 }
 
+// Thinking indicator with elapsed time
+function ThinkingIndicator({ startTime, nextPollIn, onCancel }: { startTime: number; nextPollIn: number; onCancel: () => void }) {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [startTime]);
+
+  const formatElapsed = (secs: number): string => {
+    if (secs < 60) return `${secs}s`;
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}m ${s}s`;
+  };
+
+  return (
+    <div className="thinking-indicator">
+      <div className="thinking-dots">
+        <span className="thinking-dot" />
+        <span className="thinking-dot" />
+        <span className="thinking-dot" />
+      </div>
+      <div className="thinking-text">
+        <span className="thinking-label">Thinking...</span>
+        <span className="thinking-elapsed">{formatElapsed(elapsed)}</span>
+        <span className="thinking-poll">next check in {Math.ceil(nextPollIn / 1000)}s</span>
+      </div>
+      <button className="thinking-cancel" onClick={onCancel} title="Cancel waiting">
+        Cancel
+      </button>
+    </div>
+  );
+}
+
 // Main content area
 function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpdate: () => void }) {
   const { channel, channels, posts, loading, refetchPosts } = useChannel(channelId);
   const { events, connected } = useSSE('/api/events/stream');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when new posts arrive
-  useEffect(() => {
+  // Smart scroll: track whether user is near the bottom
+  const isNearBottom = useRef(true);
+  const [newMessageCount, setNewMessageCount] = useState(0);
+  const prevPostCount = useRef(0);
+
+  const checkIfNearBottom = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const threshold = 100; // px from bottom
+    isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    setNewMessageCount(0);
+    isNearBottom.current = true;
+  }, []);
+
+  // Thinking / waiting-for-response state
+  const [thinking, setThinking] = useState(false);
+  const [thinkingStart, setThinkingStart] = useState(0);
+  const [nextPollIn, setNextPollIn] = useState(0);
+  const postCountAtSend = useRef(0);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backoffStep = useRef(0);
+
+  const INITIAL_DELAY = 15_000; // 15s first check
+  const MAX_DELAY = 120_000;    // cap at 2 minutes
+
+  const clearPolling = useCallback(() => {
+    if (pollTimer.current) {
+      clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
+    setThinking(false);
+    setNextPollIn(0);
+    backoffStep.current = 0;
+  }, []);
+
+  const scheduleNextPoll = useCallback(() => {
+    const delay = Math.min(INITIAL_DELAY * Math.pow(2, backoffStep.current), MAX_DELAY);
+    setNextPollIn(delay);
+
+    pollTimer.current = setTimeout(async () => {
+      await refetchPosts();
+      // After refetch, the posts effect below will check if we got a response
+      // If no new posts, schedule next poll with increased backoff
+      backoffStep.current += 1;
+      scheduleNextPoll();
+    }, delay);
+  }, [refetchPosts]);
+
+  // Start thinking after user sends a message with an @mention
+  const handleUserSent = useCallback((hasMention: boolean) => {
+    refetchPosts();
+    onTaskUpdate();
+    if (hasMention) {
+      postCountAtSend.current = posts.length + 1; // +1 for the post the user just sent
+      setThinking(true);
+      setThinkingStart(Date.now());
+      backoffStep.current = 0;
+      if (pollTimer.current) clearTimeout(pollTimer.current);
+      scheduleNextPoll();
+    }
+  }, [refetchPosts, onTaskUpdate, posts.length, scheduleNextPoll]);
+
+  // Stop thinking when we get new posts from someone other than "user"
+  useEffect(() => {
+    if (!thinking) return;
+    // Check if any post arrived after the user's send
+    if (posts.length > postCountAtSend.current) {
+      const newPosts = posts.slice(postCountAtSend.current);
+      const hasAgentResponse = newPosts.some(p => p.authorId !== 'user');
+      if (hasAgentResponse) {
+        clearPolling();
+      }
+    }
+  }, [posts, thinking, clearPolling]);
+
+  // Clear thinking on SSE task events (agent responded via SSE)
+  useEffect(() => {
+    if (!thinking || events.length === 0) return;
+    const lastEvent = events[events.length - 1];
+    if (lastEvent.type === 'task.completed' || lastEvent.type === 'task.failed') {
+      clearPolling();
+    }
+  }, [events, thinking, clearPolling]);
+
+  // Clear polling on unmount or channel change
+  useEffect(() => {
+    return () => {
+      if (pollTimer.current) clearTimeout(pollTimer.current);
+    };
+  }, [channelId]);
+
+  // Reset thinking when switching channels
+  useEffect(() => {
+    clearPolling();
+  }, [channelId, clearPolling]);
+
+  // Smart auto-scroll: only scroll if user is near the bottom, otherwise count new messages
+  useEffect(() => {
+    const newCount = posts.length - prevPostCount.current;
+    if (prevPostCount.current > 0 && newCount > 0) {
+      if (isNearBottom.current) {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      } else {
+        setNewMessageCount(prev => prev + newCount);
+      }
+    }
+    prevPostCount.current = posts.length;
   }, [posts]);
+
+  // Scroll to bottom when thinking indicator appears (user just sent)
+  useEffect(() => {
+    if (thinking && isNearBottom.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [thinking]);
 
   // Refetch posts when SSE event arrives
   useEffect(() => {
@@ -259,46 +563,60 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
         )}
       </header>
 
-      <div className="messages-container">
-        {loading ? (
-          <div className="empty-state">
-            <div className="empty-state-icon">⏳</div>
-            <div className="empty-state-title">Loading...</div>
-          </div>
-        ) : !channel ? (
-          <div className="empty-state">
-            <div className="empty-state-icon">🐝</div>
-            <div className="empty-state-title">Welcome to Hive</div>
-            <div className="empty-state-desc">Select a channel from the sidebar to start chatting with agents.</div>
-          </div>
-        ) : posts.length === 0 ? (
-          <div className="empty-state">
-            <div className="empty-state-icon">💬</div>
-            <div className="empty-state-title">No messages yet</div>
-            <div className="empty-state-desc">Be the first to post in #{channel.name}. Use @agent to mention agents.</div>
-          </div>
-        ) : (
-          <>
-            {posts.map(post => (
-              <Message key={post.id} post={post} />
-            ))}
-            <div ref={messagesEndRef} />
-          </>
+      <div className="messages-container-wrapper">
+        <div className="messages-container" ref={messagesContainerRef} onScroll={checkIfNearBottom}>
+          {loading ? (
+            <div className="empty-state">
+              <div className="empty-state-icon">⏳</div>
+              <div className="empty-state-title">Loading...</div>
+            </div>
+          ) : !channel ? (
+            <div className="empty-state">
+              <div className="empty-state-icon">🐝</div>
+              <div className="empty-state-title">Welcome to Hive</div>
+              <div className="empty-state-desc">Select a channel from the sidebar to start chatting with agents.</div>
+            </div>
+          ) : posts.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-state-icon">💬</div>
+              <div className="empty-state-title">No messages yet</div>
+              <div className="empty-state-desc">Be the first to post in #{channel.name}. Use @agent to mention agents.</div>
+            </div>
+          ) : (
+            <>
+              {posts.map(post => (
+                <Message key={post.id} post={post} />
+              ))}
+              {thinking && (
+                <ThinkingIndicator startTime={thinkingStart} nextPollIn={nextPollIn} onCancel={clearPolling} />
+              )}
+              <div ref={messagesEndRef} />
+            </>
+          )}
+        </div>
+
+        {newMessageCount > 0 && (
+          <button className="new-messages-btn" onClick={scrollToBottom}>
+            {newMessageCount} new message{newMessageCount !== 1 ? 's' : ''} — click to scroll down
+          </button>
         )}
       </div>
 
       {channel && (
-        <Composer channelId={channel.id} onSend={() => { refetchPosts(); onTaskUpdate(); }} />
+        <Composer channelId={channel.id} posts={posts} onSend={handleUserSent} />
       )}
     </div>
   );
 }
 
 // Message component
+const COLLAPSE_LINE_THRESHOLD = 20;
+
 function Message({ post }: { post: Post }) {
   const { agents } = useAgents();
   const agent = agents.find(a => a.id === post.authorId);
   const isAgent = agent !== undefined;
+  const [expanded, setExpanded] = useState(false);
   
   // Format timestamp
   const time = new Date(post.createdAt).toLocaleTimeString('en-US', {
@@ -306,9 +624,51 @@ function Message({ post }: { post: Post }) {
     minute: '2-digit',
   });
 
+  // Extract text from a single JSON event payload
+  const extractText = (jsonStr: string): string | null => {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      // Handle Hive event format: { type, part: { text } }
+      if (parsed.part?.text) return parsed.part.text;
+      // Handle simple { text } format
+      if (typeof parsed.text === 'string') return parsed.text;
+      // Handle { content } format
+      if (typeof parsed.content === 'string') return parsed.content;
+      // Handle { message } format
+      if (typeof parsed.message === 'string') return parsed.message;
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Parse content — extract text from JSON event payloads if needed
+  // Handles single JSON objects and newline-delimited JSON (multiple events)
+  const parseContent = (content: string): string => {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) return content;
+
+    // Try single JSON object first
+    const single = extractText(trimmed);
+    if (single !== null) return single;
+
+    // Try newline-delimited JSON (multiple events in one content field)
+    const lines = trimmed.split('\n').filter(l => l.trim().startsWith('{'));
+    if (lines.length > 1) {
+      const texts = lines
+        .map(line => extractText(line.trim()))
+        .filter((t): t is string => t !== null);
+      if (texts.length > 0) return texts.join('');
+    }
+
+    // Fallback: return original
+    return content;
+  };
+
   // Highlight @mentions
   const formatContent = (content: string) => {
-    const parts = content.split(/(@\w+)/g);
+    const text = parseContent(content);
+    const parts = text.split(/(@\w+)/g);
     return parts.map((part, i) => {
       if (part.startsWith('@')) {
         return <span key={i} style={{ color: 'var(--accent)' }}>{part}</span>;
@@ -316,6 +676,10 @@ function Message({ post }: { post: Post }) {
       return part;
     });
   };
+
+  const parsedText = parseContent(post.content);
+  const lineCount = parsedText.split('\n').length;
+  const isLong = lineCount > COLLAPSE_LINE_THRESHOLD;
 
   return (
     <div className={`message ${isAgent ? 'agent' : ''}`}>
@@ -327,14 +691,21 @@ function Message({ post }: { post: Post }) {
           <span className="message-author">{post.authorId}</span>
           <span className="message-time">{time}</span>
         </div>
-        <div className="message-body">{formatContent(post.content)}</div>
+        <div className={`message-body ${isLong && !expanded ? 'collapsed' : ''}`}>
+          {formatContent(post.content)}
+        </div>
+        {isLong && (
+          <button className="message-toggle" onClick={() => setExpanded(!expanded)}>
+            {expanded ? 'Show less' : `Show more (${lineCount} lines)`}
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
 // Composer component
-function Composer({ channelId, onSend }: { channelId: string; onSend: () => void }) {
+function Composer({ channelId, posts, onSend }: { channelId: string; posts: Post[]; onSend: (hasMention: boolean) => void }) {
   const [content, setContent] = useState('');
   const [sending, setSending] = useState(false);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -342,19 +713,55 @@ function Composer({ channelId, onSend }: { channelId: string; onSend: () => void
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { agents } = useAgents();
 
+  // Detect implied agent from conversation context
+  // Walk backwards: find the last agent who responded, and check if
+  // the user previously mentioned them — implies ongoing conversation
+  const impliedAgent = useMemo(() => {
+    if (posts.length < 2) return null;
+    const agentIds = new Set(agents.map(a => a.id));
+
+    // Walk backwards to find the pattern: user mentioned agent -> agent replied
+    for (let i = posts.length - 1; i >= 0; i--) {
+      const post = posts[i];
+      // Found an agent's reply — check if user mentioned them earlier
+      if (agentIds.has(post.authorId)) {
+        const agentId = post.authorId;
+        // Look further back for a user message that mentioned this agent
+        for (let j = i - 1; j >= 0; j--) {
+          if (posts[j].authorId === 'user' && posts[j].content.includes(`@${agentId}`)) {
+            return agentId;
+          }
+          // If we hit another agent's message, stop — context changed
+          if (agentIds.has(posts[j].authorId) && posts[j].authorId !== agentId) {
+            break;
+          }
+        }
+        break; // only check the most recent agent reply
+      }
+      // If we hit a user message without finding an agent reply first, no implied agent
+      if (post.authorId === 'user') break;
+    }
+    return null;
+  }, [posts, agents]);
+
   const handleSubmit = async () => {
     if (!content.trim() || sending) return;
     
+    const hasExplicitMention = /@\w+/.test(content);
+    const willImply = !hasExplicitMention && impliedAgent !== null;
+    const finalContent = willImply ? `@${impliedAgent} ${content.trim()}` : content.trim();
+    const hasMention = hasExplicitMention || willImply;
+
     setSending(true);
     try {
       await api.createPost({
         channelId,
         authorId: 'user',
-        content: content.trim(),
+        content: finalContent,
       });
       setContent('');
       setMentionQuery(null);
-      onSend();
+      onSend(hasMention);
     } catch (err) {
       console.error('Failed to send message:', err);
     } finally {
@@ -411,13 +818,22 @@ function Composer({ channelId, onSend }: { channelId: string; onSend: () => void
     inputRef.current.focus();
   };
 
+  const placeholder = impliedAgent
+    ? `Reply to @${impliedAgent}... (mention auto-added)`
+    : 'Type a message... Use @agent to mention agents';
+
   return (
     <div className="composer">
+      {impliedAgent && !/@\w+/.test(content) && content.trim() && (
+        <div className="composer-implied">
+          replying to <span className="composer-implied-agent">@{impliedAgent}</span>
+        </div>
+      )}
       <div className="input-wrapper">
         <textarea
           ref={inputRef}
           className="input"
-          placeholder="Type a message... Use @agent to mention agents"
+          placeholder={placeholder}
           value={content}
           onChange={handleInput}
           onKeyDown={handleKeyDown}

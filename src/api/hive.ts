@@ -1,5 +1,6 @@
 // Hive API client
 
+// Always use /api — the Vite dynamic proxy handles routing to the correct server
 const API_BASE = '/api';
 
 interface ApiResponse<T> {
