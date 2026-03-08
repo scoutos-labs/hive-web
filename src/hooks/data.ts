@@ -41,15 +41,24 @@ export function usePosts(channelId: string | null) {
   const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const lastChannelId = useRef<string | null>(null);
 
   const fetchPosts = async () => {
     if (!channelId) {
       setPosts([]);
       setLoading(false);
+      lastChannelId.current = null;
       return;
     }
+
+    const isChannelSwitch = lastChannelId.current !== channelId;
+
     try {
-      setLoading(true);
+      // Keep existing messages visible during background refetches.
+      // Only show the loading state when switching channels.
+      if (isChannelSwitch) {
+        setLoading(true);
+      }
       const data = await api.getPosts(channelId);
       // Sort by creation time, oldest first for chat
       setPosts(data.sort((a, b) => a.createdAt - b.createdAt));
@@ -57,6 +66,7 @@ export function usePosts(channelId: string | null) {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch posts');
     } finally {
+      lastChannelId.current = channelId;
       setLoading(false);
     }
   };

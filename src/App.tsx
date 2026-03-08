@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import { useChannels, useAgents, useChannel, useSSE, useMentions, useProgress } from './hooks/data';
 import type { ProgressMessage } from './hooks/data';
 import { api, type Post } from './api/hive';
@@ -19,14 +19,12 @@ function MentionAutocomplete({
   query,
   agents,
   position,
-  onSelect,
-  onClose
+  onSelect
 }: {
   query: string;
   agents: { id: string; name: string }[];
   position: { top: number; left: number };
   onSelect: (agentId: string) => void;
-  onClose: () => void;
 }) {
   const filtered = useMemo(() => {
     if (!query) return agents;
@@ -50,7 +48,7 @@ function MentionAutocomplete({
           className="mention-option"
           onClick={() => onSelect(agent.id)}
         >
-          <span className="mention-option-icon">🤖</span>
+          <span className="mention-option-icon" />
           <span className="mention-option-name">{agent.name}</span>
           <span className="mention-option-id">@{agent.id}</span>
         </div>
@@ -209,7 +207,7 @@ function ActiveTasks({ mentions }: { mentions: ReturnType<typeof useMentions>['m
   return (
     <div className="sidebar-section">
       <div className="sidebar-section-title">
-        Active Tasks
+        // active_tasks
         {running.length > 0 && <span className="badge">{running.length}</span>}
       </div>
       {recent.map(mention => (
@@ -291,13 +289,13 @@ function Sidebar({
     <aside className="sidebar">
       <div className="sidebar-header">
         <div className="sidebar-logo">
-          <div className="sidebar-logo-icon">🐝</div>
-          <span>Hive</span>
+          <div className="sidebar-logo-icon">H</div>
+          <span>HIVE_WEB</span>
         </div>
       </div>
       
       <div className="sidebar-section">
-        <div className="sidebar-section-title">Channels</div>
+        <div className="sidebar-section-title">// channels</div>
         {loading ? (
           <div className="sidebar-item" style={{ color: 'var(--text-muted)' }}>Loading...</div>
         ) : channels.length === 0 ? (
@@ -317,7 +315,7 @@ function Sidebar({
       </div>
 
       <div className="sidebar-section">
-        <div className="sidebar-section-title">Agents</div>
+        <div className="sidebar-section-title">// agents</div>
         {agentsLoading ? (
           <div className="sidebar-item" style={{ color: 'var(--text-muted)' }}>Loading...</div>
         ) : (
@@ -331,7 +329,7 @@ function Sidebar({
                 <div className="agent-item-info">
                   <div className="agent-item-name">{agent.name}</div>
                   <div className="agent-item-status">
-                    {isRunning ? 'running' : 'idle'}
+                    {isRunning ? '[RUNNING]' : '[IDLE]'}
                   </div>
                 </div>
               </div>
@@ -351,7 +349,7 @@ function Sidebar({
           }
         }}
       >
-        + New Channel
+        + new_channel
       </button>
     </aside>
   );
@@ -396,9 +394,12 @@ function ThinkingIndicator({ startTime, nextPollIn, onCancel }: { startTime: num
 
 // Main content area
 function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpdate: () => void }) {
-  const { channel, channels, posts, loading, refetchPosts } = useChannel(channelId);
+  const { channel, posts, loading, refetchPosts } = useChannel(channelId);
   const { events, connected } = useSSE('/api/events/stream');
   const { progressMessages, streamingAgentId, addProgress, clearProgress } = useProgress(channelId);
+  const INITIAL_VISIBLE_POSTS = 120;
+  const LOAD_MORE_POSTS = 80;
+  const TOP_LOAD_THRESHOLD = 120;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
@@ -406,19 +407,60 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
   const isNearBottom = useRef(true);
   const [newMessageCount, setNewMessageCount] = useState(0);
   const prevPostCount = useRef(0);
+  const [visibleStartIndex, setVisibleStartIndex] = useState(0);
+  const pendingPrependAdjust = useRef<{ previousHeight: number; previousTop: number } | null>(null);
+  const lastChannelId = useRef<string | null>(null);
+
+  const visiblePosts = useMemo(() => posts.slice(visibleStartIndex), [posts, visibleStartIndex]);
+
+  const getDistanceFromBottom = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return Number.POSITIVE_INFINITY;
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  }, []);
 
   const checkIfNearBottom = useCallback(() => {
+    const threshold = 100; // px from bottom
+    isNearBottom.current = getDistanceFromBottom() < threshold;
+  }, [getDistanceFromBottom]);
+
+  const loadOlderPosts = useCallback(() => {
+    if (visibleStartIndex <= 0) return;
+    const el = messagesContainerRef.current;
+    if (el) {
+      pendingPrependAdjust.current = {
+        previousHeight: el.scrollHeight,
+        previousTop: el.scrollTop,
+      };
+    }
+    setVisibleStartIndex(prev => Math.max(0, prev - LOAD_MORE_POSTS));
+  }, [visibleStartIndex, LOAD_MORE_POSTS]);
+
+  const handleMessagesScroll = useCallback(() => {
+    checkIfNearBottom();
     const el = messagesContainerRef.current;
     if (!el) return;
-    const threshold = 100; // px from bottom
-    isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
-  }, []);
+    if (el.scrollTop <= TOP_LOAD_THRESHOLD && visibleStartIndex > 0) {
+      loadOlderPosts();
+    }
+  }, [checkIfNearBottom, visibleStartIndex, loadOlderPosts, TOP_LOAD_THRESHOLD]);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     setNewMessageCount(0);
     isNearBottom.current = true;
   }, []);
+
+  useLayoutEffect(() => {
+    const pending = pendingPrependAdjust.current;
+    if (!pending) return;
+    const el = messagesContainerRef.current;
+    if (!el) return;
+
+    const heightDelta = el.scrollHeight - pending.previousHeight;
+    el.scrollTop = pending.previousTop + heightDelta;
+    pendingPrependAdjust.current = null;
+  }, [visibleStartIndex, posts.length]);
 
   // Thinking / waiting-for-response state
   const [thinking, setThinking] = useState(false);
@@ -502,18 +544,70 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
     clearPolling();
   }, [channelId, clearPolling]);
 
+  // Window messages and jump to latest when channel changes
+  useEffect(() => {
+    if (channelId === null) {
+      lastChannelId.current = null;
+      setVisibleStartIndex(0);
+      return;
+    }
+    if (loading) return;
+
+    const switchedChannel = lastChannelId.current !== channelId;
+    if (!switchedChannel) return;
+
+    const start = Math.max(0, posts.length - INITIAL_VISIBLE_POSTS);
+    setVisibleStartIndex(start);
+    setNewMessageCount(0);
+    prevPostCount.current = posts.length;
+    lastChannelId.current = channelId;
+
+    requestAnimationFrame(() => {
+      const el = messagesContainerRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+      isNearBottom.current = true;
+    });
+  }, [channelId, loading, posts.length, INITIAL_VISIBLE_POSTS]);
+
+  useEffect(() => {
+    setVisibleStartIndex(prev => Math.min(prev, Math.max(0, posts.length - 1)));
+  }, [posts.length]);
+
   // Smart auto-scroll: only scroll if user is near the bottom, otherwise count new messages
   useEffect(() => {
+    const threshold = 100;
+    const distanceFromBottom = getDistanceFromBottom();
+    const nearBottom = distanceFromBottom < threshold;
+
     const newCount = posts.length - prevPostCount.current;
     if (prevPostCount.current > 0 && newCount > 0) {
-      if (isNearBottom.current) {
+      if (nearBottom) {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       } else {
         setNewMessageCount(prev => prev + newCount);
       }
     }
+
+    isNearBottom.current = nearBottom;
     prevPostCount.current = posts.length;
-  }, [posts]);
+  }, [posts, getDistanceFromBottom]);
+
+  // Keep viewport pinned to the latest streamed chunk while already at the bottom
+  useEffect(() => {
+    if (!streamingAgentId || progressMessages.length === 0) return;
+
+    const threshold = 100;
+    const nearBottom = getDistanceFromBottom() < threshold;
+    if (!nearBottom && !isNearBottom.current) return;
+
+    const el = messagesContainerRef.current;
+    if (!el) return;
+
+    el.scrollTop = el.scrollHeight;
+    isNearBottom.current = true;
+    setNewMessageCount(0);
+  }, [progressMessages, streamingAgentId, getDistanceFromBottom]);
 
   // Scroll to bottom when thinking indicator appears (user just sent)
   useEffect(() => {
@@ -571,17 +665,17 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
             <div className="main-meta">
               <span className={`status-indicator ${connected ? 'connected' : 'disconnected'}`}>
                 <span className={`status-dot ${connected ? 'completed' : 'idle'}`}></span>
-                {connected ? 'Connected' : 'Disconnected'}
+                {connected ? 'SSE [CONNECTED]' : 'SSE [DISCONNECTED]'}
               </span>
             </div>
           </>
         ) : (
-          <h1 className="main-title">Select a channel</h1>
+          <h1 className="main-title">select_channel //</h1>
         )}
       </header>
 
       <div className="messages-container-wrapper">
-        <div className="messages-container" ref={messagesContainerRef} onScroll={checkIfNearBottom}>
+        <div className="messages-container" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
           {loading ? (
             <div className="empty-state">
               <div className="empty-state-icon">⏳</div>
@@ -589,19 +683,19 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
             </div>
           ) : !channel ? (
             <div className="empty-state">
-              <div className="empty-state-icon">🐝</div>
-              <div className="empty-state-title">Welcome to Hive</div>
-              <div className="empty-state-desc">Select a channel from the sidebar to start chatting with agents.</div>
+              <div className="empty-state-icon" style={{ background: 'var(--accent-orange)', width: 64, height: 64, borderRadius: 'var(--radius-lg)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 32, color: 'var(--text-on-accent)', fontFamily: 'var(--font-display)', fontWeight: 700 }}>H</div>
+              <div className="empty-state-title">welcome_to_hive //</div>
+              <div className="empty-state-desc">Communicate with AI agents in real-time channels. Select a channel from the sidebar to get started.</div>
             </div>
           ) : posts.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-state-icon">💬</div>
-              <div className="empty-state-title">No messages yet</div>
-              <div className="empty-state-desc">Be the first to post in #{channel.name}. Use @agent to mention agents.</div>
+              <div className="empty-state-icon" style={{ fontSize: 32, opacity: 0.3 }}>#</div>
+              <div className="empty-state-title">no_messages //</div>
+              <div className="empty-state-desc">Be the first to post in #{channel.name}. Use @agent_name to mention agents.</div>
             </div>
           ) : (
             <>
-              {posts.map(post => (
+              {visiblePosts.map(post => (
                 <Message key={post.id} post={post} />
               ))}
               {progressMessages.map(msg => (
@@ -763,7 +857,7 @@ function Message({ post }: { post: Post }) {
     const parts = text.split(/(@\w+)/g);
     return parts.map((part, i) => {
       if (part.startsWith('@')) {
-        return <span key={i} style={{ color: 'var(--accent)' }}>{part}</span>;
+        return <span key={i} style={{ color: 'var(--accent-orange)' }}>{part}</span>;
       }
       return part;
     });
@@ -776,7 +870,7 @@ function Message({ post }: { post: Post }) {
   return (
     <div className={`message ${isAgent ? 'agent' : ''}`}>
       <div className="agent-avatar">
-        {isAgent ? '🤖' : '👤'}
+        {post.authorId.charAt(0).toUpperCase()}
       </div>
       <div className="message-content">
         <div className="message-header">
@@ -947,7 +1041,6 @@ function Composer({ channelId, posts, onSend }: { channelId: string; posts: Post
           agents={agents}
           position={mentionPosition}
           onSelect={handleMentionSelect}
-          onClose={() => setMentionQuery(null)}
         />
       )}
     </div>
