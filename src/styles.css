@@ -1128,3 +1128,57 @@ body {
 .message-toggle:hover {
   color: var(--accent-dim);
 }
+
+/* Streaming progress message */
+.message.streaming {
+  border-left: 3px solid var(--warning);
+  background: var(--bg-tertiary);
+}
+
+.streaming-indicator {
+  color: var(--warning);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-right: 8px;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.message-elapsed {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.streaming-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.streaming-body pre.collapsed {
+  max-height: calc(1.5em * 20);
+  overflow: hidden;
+  position: relative;
+  mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+}
+
+.streaming-body .message-toggle {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 4px 0;
+  margin-top: 4px;
+}
+
+.message.streaming .agent-avatar {
+  animation: pulse 1s ease-in-out infinite;
+  border-color: var(--warning);
+}

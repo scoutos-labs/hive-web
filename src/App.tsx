@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { useChannels, useAgents, useChannel, useSSE, useMentions } from './hooks/data';
+import { useChannels, useAgents, useChannel, useSSE, useMentions, useProgress } from './hooks/data';
+import type { ProgressMessage } from './hooks/data';
 import { api, type Post } from './api/hive';
 import { initNotifications, notifyAgentComplete, notifyAgentFailed } from './notifications';
 import {
@@ -397,6 +398,7 @@ function ThinkingIndicator({ startTime, nextPollIn, onCancel }: { startTime: num
 function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpdate: () => void }) {
   const { channel, channels, posts, loading, refetchPosts } = useChannel(channelId);
   const { events, connected } = useSSE('/api/events/stream');
+  const { progressMessages, streamingAgentId, addProgress, clearProgress } = useProgress(channelId);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
@@ -522,28 +524,43 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
 
   // Refetch posts when SSE event arrives
   useEffect(() => {
-    if (events.length > 0) {
-      const lastEvent = events[events.length - 1];
-      if (lastEvent.type === 'task.completed') {
-        refetchPosts();
-        onTaskUpdate();
-        const agentId = lastEvent.payload?.agentId || 'agent';
-        const channelName = channel?.name || 'unknown';
-        notifyAgentComplete(agentId, channelName);
-      }
-      if (lastEvent.type === 'task.failed') {
-        refetchPosts();
-        onTaskUpdate();
-        const agentId = lastEvent.payload?.agentId || 'agent';
-        const channelName = channel?.name || 'unknown';
-        const error = lastEvent.payload?.error;
-        notifyAgentFailed(agentId, channelName, error);
-      }
-      if (lastEvent.type === 'task.started') {
-        onTaskUpdate();
+    if (events.length === 0) return;
+    const lastEvent = events[events.length - 1];
+    
+    // Handle task progress - accumulate streaming output
+    if (lastEvent.type === 'task.progress') {
+      const { agentId, channelId, chunk } = lastEvent.payload || {};
+      if (agentId && channelId && chunk) {
+        addProgress({ agentId, channelId, chunk });
       }
     }
-  }, [events, refetchPosts, onTaskUpdate, channel]);
+    
+    // Handle task completion - clear progress and fetch final post
+    if (lastEvent.type === 'task.completed') {
+      const agentId = lastEvent.payload?.agentId;
+      clearProgress(agentId);
+      refetchPosts();
+      onTaskUpdate();
+      const channelName = channel?.name || 'unknown';
+      notifyAgentComplete(agentId || 'agent', channelName);
+    }
+    
+    // Handle task failure - clear progress and show error
+    if (lastEvent.type === 'task.failed') {
+      const agentId = lastEvent.payload?.agentId;
+      clearProgress(agentId);
+      refetchPosts();
+      onTaskUpdate();
+      const channelName = channel?.name || 'unknown';
+      const error = lastEvent.payload?.error;
+      notifyAgentFailed(agentId || 'agent', channelName, error);
+    }
+    
+    // Handle task started - clear any stale progress
+    if (lastEvent.type === 'task.started') {
+      onTaskUpdate();
+    }
+  }, [events, refetchPosts, onTaskUpdate, channel, addProgress, clearProgress]);
 
   return (
     <div className="main">
@@ -587,6 +604,9 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
               {posts.map(post => (
                 <Message key={post.id} post={post} />
               ))}
+              {progressMessages.map(msg => (
+                <ProgressMessage key={msg.id} message={msg} />
+              ))}
               {thinking && (
                 <ThinkingIndicator startTime={thinkingStart} nextPollIn={nextPollIn} onCancel={clearPolling} />
               )}
@@ -605,6 +625,78 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
       {channel && (
         <Composer channelId={channel.id} posts={posts} onSend={handleUserSent} />
       )}
+    </div>
+  );
+}
+
+// Progress message component - shows streaming output from agents
+function ProgressMessage({ message }: { message: ProgressMessage }) {
+  const { agents } = useAgents();
+  const agent = agents.find(a => a.id === message.agentId);
+  
+  // Format timestamp
+  const time = new Date(message.timestamp).toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+
+  // Format content - handle both plain text and JSONL
+  const formatContent = (content: string): string => {
+    if (!content) return '';
+    
+    // Try to parse as JSONL and extract text
+    const lines = content.split('\n').filter(l => l.trim());
+    const texts: string[] = [];
+    
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === 'text' && parsed.content) {
+          texts.push(parsed.content);
+        } else if (parsed.type === 'text' && parsed.text) {
+          texts.push(parsed.text);
+        } else if (parsed.text) {
+          texts.push(parsed.text);
+        }
+      } catch {
+        // Not JSON, treat as plain text
+        texts.push(line);
+      }
+    }
+    
+    return texts.join('\n');
+  };
+
+  const formattedContent = formatContent(message.content);
+  const lineCount = formattedContent.split('\n').length;
+  const shouldCollapse = lineCount > 10 && !formattedContent.includes('```');
+  
+  const [expanded, setExpanded] = useState(!shouldCollapse);
+
+  return (
+    <div className="message agent streaming">
+      <div className="agent-avatar running">
+        {message.agentId.charAt(0).toUpperCase()}
+      </div>
+      <div className="message-content">
+        <div className="message-header">
+          <span className="message-author">{agent?.name || message.agentId}</span>
+          <span className="message-time">
+            <span className="streaming-indicator">◐ streaming...</span>
+            <span className="message-elapsed">{time}</span>
+          </span>
+        </div>
+        <div className="message-body streaming-body">
+          <pre className={expanded ? '' : 'collapsed'}>
+            {formattedContent}
+          </pre>
+          {shouldCollapse && (
+            <button className="message-toggle" onClick={() => setExpanded(!expanded)}>
+              {expanded ? 'Show less' : `Show more (${lineCount} lines)`}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
