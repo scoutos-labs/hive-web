@@ -1,7 +1,15 @@
 import { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
-import { useChannels, useAgents, useChannel, useSSE, useMentions, useProgress } from './hooks/data';
-import type { ProgressMessage } from './hooks/data';
-import { api, type Post } from './api/hive';
+import {
+  useChannels,
+  useAgents,
+  useChannel,
+  useSSE,
+  useMentions,
+  useProgress,
+  type HiveEvent,
+  type ProgressMessage,
+} from './hooks/data';
+import { api, type Channel, type Post } from './api/hive';
 import { initNotifications, notifyAgentComplete, notifyAgentFailed } from './notifications';
 import {
   getCurrentServer,
@@ -13,6 +21,120 @@ import {
   removeFromHistory,
 } from './server';
 import './styles.css';
+
+const UNREAD_STORAGE_KEY = 'hive-unread-counts';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function getEventPayload(event: HiveEvent): Record<string, unknown> {
+  if (isRecord(event.payload)) return event.payload;
+  return {};
+}
+
+function toPost(value: unknown): Post | null {
+  if (!isRecord(value)) return null;
+  const id = typeof value.id === 'string' ? value.id : null;
+  const channelId = typeof value.channelId === 'string' ? value.channelId : null;
+  const authorId = typeof value.authorId === 'string' ? value.authorId : null;
+  const content = typeof value.content === 'string' ? value.content : null;
+  const createdAt = typeof value.createdAt === 'number' ? value.createdAt : null;
+
+  if (!id || !channelId || !authorId || content === null || createdAt === null) {
+    return null;
+  }
+
+  return {
+    id,
+    channelId,
+    authorId,
+    content,
+    createdAt,
+    updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : undefined,
+    mentions: Array.isArray(value.mentions)
+      ? value.mentions.filter((mention): mention is string => typeof mention === 'string')
+      : [],
+  };
+}
+
+function getEventPost(event: HiveEvent): Post | null {
+  const payload = getEventPayload(event);
+  return toPost(payload.post) ?? toPost(payload.data) ?? toPost(event.post) ?? toPost(event.data);
+}
+
+function getEventChannelId(event: HiveEvent): string | null {
+  const payload = getEventPayload(event);
+  if (typeof payload.channelId === 'string') return payload.channelId;
+  const post = getEventPost(event);
+  if (post) return post.channelId;
+  if (typeof event.channelId === 'string') return event.channelId;
+  return null;
+}
+
+function toChannel(value: unknown): Channel | null {
+  if (!isRecord(value)) return null;
+  const id = typeof value.id === 'string' ? value.id : null;
+  const name = typeof value.name === 'string' ? value.name : null;
+  const createdAt = typeof value.createdAt === 'number' ? value.createdAt : null;
+  const updatedAt = typeof value.updatedAt === 'number' ? value.updatedAt : null;
+
+  if (!id || !name || createdAt === null || updatedAt === null) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    description: typeof value.description === 'string' ? value.description : undefined,
+    createdBy: typeof value.createdBy === 'string' ? value.createdBy : undefined,
+    createdAt,
+    updatedAt,
+    isPrivate: typeof value.isPrivate === 'boolean' ? value.isPrivate : undefined,
+    members: Array.isArray(value.members)
+      ? value.members.filter((member): member is string => typeof member === 'string')
+      : undefined,
+  };
+}
+
+function getEventChannel(event: HiveEvent): Channel | null {
+  const payload = getEventPayload(event);
+  return toChannel(payload.channel) ?? toChannel(payload.data) ?? toChannel(event.channel) ?? toChannel(event.data);
+}
+
+function upsertChannel(items: Channel[], channel: Channel): Channel[] {
+  const next = items.filter(item => item.id !== channel.id);
+  next.push(channel);
+  return next.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function sortPostsChronologically(items: Post[]): Post[] {
+  return [...items].sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function upsertPost(items: Post[], post: Post): Post[] {
+  const next = items.filter(item => item.id !== post.id);
+  next.push(post);
+  return sortPostsChronologically(next);
+}
+
+function readStoredUnreadCounts(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(UNREAD_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed)) return {};
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, number] => {
+        const [, value] = entry;
+        return typeof value === 'number' && value > 0;
+      })
+    );
+  } catch {
+    return {};
+  }
+}
 
 // Mention autocomplete component
 function MentionAutocomplete({
@@ -228,33 +350,94 @@ function ActiveTasks({ mentions }: { mentions: ReturnType<typeof useMentions>['m
 // Main App
 export default function App() {
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
-  const { channels, loading: channelsLoading } = useChannels();
+  const [channelScrollToken, setChannelScrollToken] = useState(0);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>(() => readStoredUnreadCounts());
+  const { channels, loading: channelsLoading, refetch: refetchChannels } = useChannels();
   const { mentions, refetch: refetchMentions } = useMentions();
+  const { lastEvent, connected } = useSSE('/api/events/stream');
+  const [liveChannels, setLiveChannels] = useState<Channel[]>([]);
   
   // Initialize notifications on mount
   useEffect(() => {
     initNotifications();
   }, []);
-  
+
+  useEffect(() => {
+    setLiveChannels(channels);
+  }, [channels]);
+
+  useEffect(() => {
+    localStorage.setItem(UNREAD_STORAGE_KEY, JSON.stringify(unreadCounts));
+  }, [unreadCounts]);
+
+  useEffect(() => {
+    if (!lastEvent) return;
+
+    if (lastEvent.type === 'post.created') {
+      const eventPost = getEventPost(lastEvent);
+      if (eventPost && eventPost.channelId !== selectedChannelId) {
+        setUnreadCounts(prev => ({
+          ...prev,
+          [eventPost.channelId]: (prev[eventPost.channelId] ?? 0) + 1,
+        }));
+      }
+    }
+
+    if (lastEvent.type === 'channel.created' || lastEvent.type === 'channel.updated') {
+      const eventChannel = getEventChannel(lastEvent);
+      if (eventChannel) {
+        setLiveChannels(prev => upsertChannel(prev, eventChannel));
+      } else {
+        refetchChannels();
+      }
+    }
+  }, [lastEvent, refetchChannels, selectedChannelId]);
+
   // Select first channel by default
   useEffect(() => {
-    if (!selectedChannelId && channels.length > 0) {
-      setSelectedChannelId(channels[0].id);
+    if (!selectedChannelId && liveChannels.length > 0) {
+      setSelectedChannelId(liveChannels[0].id);
     }
-  }, [channels, selectedChannelId]);
+  }, [liveChannels, selectedChannelId]);
+
+  const handleSelectChannel = useCallback((id: string) => {
+    setSelectedChannelId(id);
+    setChannelScrollToken(prev => prev + 1);
+    setUnreadCounts(prev => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
 
   return (
     <div className="app-wrapper">
       <ServerBar />
       <div className="app">
         <Sidebar
-          channels={channels}
+          channels={liveChannels}
           loading={channelsLoading}
           selectedChannelId={selectedChannelId}
-          onSelectChannel={setSelectedChannelId}
+          onSelectChannel={handleSelectChannel}
           mentions={mentions}
+          unreadCounts={unreadCounts}
         />
-        <Main channelId={selectedChannelId} onTaskUpdate={refetchMentions} />
+        <Main
+          channelId={selectedChannelId}
+          channelScrollToken={channelScrollToken}
+          connected={connected}
+          lastEvent={lastEvent}
+          clearChannelUnread={(id) => {
+            setUnreadCounts(prev => {
+              if (!(id in prev)) return prev;
+              const next = { ...prev };
+              delete next[id];
+              return next;
+            });
+          }}
+          onTaskUpdate={refetchMentions}
+        />
       </div>
     </div>
   );
@@ -266,13 +449,15 @@ function Sidebar({
   loading, 
   selectedChannelId,
   onSelectChannel,
-  mentions
+  mentions,
+  unreadCounts,
 }: { 
   channels: ReturnType<typeof useChannels>['channels'];
   loading: boolean;
   selectedChannelId: string | null;
   onSelectChannel: (id: string) => void;
   mentions: ReturnType<typeof useMentions>['mentions'];
+  unreadCounts: Record<string, number>;
 }) {
   const { agents, loading: agentsLoading } = useAgents();
   
@@ -309,6 +494,11 @@ function Sidebar({
             >
               <span className="sidebar-item-icon">#</span>
               <span className="sidebar-item-name">{channel.name}</span>
+              {(unreadCounts[channel.id] ?? 0) > 0 && (
+                <span className="badge channel-unread-badge">
+                  {unreadCounts[channel.id] > 99 ? '99+' : unreadCounts[channel.id]}
+                </span>
+              )}
             </div>
           ))
         )}
@@ -393,25 +583,37 @@ function ThinkingIndicator({ startTime, nextPollIn, onCancel }: { startTime: num
 }
 
 // Main content area
-function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpdate: () => void }) {
+function Main({
+  channelId,
+  channelScrollToken,
+  connected,
+  lastEvent,
+  clearChannelUnread,
+  onTaskUpdate,
+}: {
+  channelId: string | null;
+  channelScrollToken: number;
+  connected: boolean;
+  lastEvent: HiveEvent | null;
+  clearChannelUnread: (id: string) => void;
+  onTaskUpdate: () => void;
+}) {
   const { channel, posts, loading, refetchPosts } = useChannel(channelId);
-  const { events, connected } = useSSE('/api/events/stream');
   const { progressMessages, streamingAgentId, addProgress, clearProgress } = useProgress(channelId);
   const INITIAL_VISIBLE_POSTS = 120;
   const LOAD_MORE_POSTS = 80;
   const TOP_LOAD_THRESHOLD = 120;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-
-  // Smart scroll: track whether user is near the bottom
+  const [livePosts, setLivePosts] = useState<Post[]>([]);
   const isNearBottom = useRef(true);
+  const [isAtBottom, setIsAtBottom] = useState(true);
   const [newMessageCount, setNewMessageCount] = useState(0);
   const prevPostCount = useRef(0);
   const [visibleStartIndex, setVisibleStartIndex] = useState(0);
   const pendingPrependAdjust = useRef<{ previousHeight: number; previousTop: number } | null>(null);
   const lastChannelId = useRef<string | null>(null);
-
-  const visiblePosts = useMemo(() => posts.slice(visibleStartIndex), [posts, visibleStartIndex]);
+  const visibleLivePosts = useMemo(() => livePosts.slice(visibleStartIndex), [livePosts, visibleStartIndex]);
 
   const getDistanceFromBottom = useCallback(() => {
     const el = messagesContainerRef.current;
@@ -420,8 +622,13 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
   }, []);
 
   const checkIfNearBottom = useCallback(() => {
-    const threshold = 100; // px from bottom
-    isNearBottom.current = getDistanceFromBottom() < threshold;
+    const threshold = 100;
+    const nextIsNearBottom = getDistanceFromBottom() < threshold;
+    isNearBottom.current = nextIsNearBottom;
+    setIsAtBottom(nextIsNearBottom);
+    if (nextIsNearBottom) {
+      setNewMessageCount(0);
+    }
   }, [getDistanceFromBottom]);
 
   const loadOlderPosts = useCallback(() => {
@@ -445,10 +652,11 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
     }
   }, [checkIfNearBottom, visibleStartIndex, loadOlderPosts, TOP_LOAD_THRESHOLD]);
 
-  const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
     setNewMessageCount(0);
     isNearBottom.current = true;
+    setIsAtBottom(true);
   }, []);
 
   useLayoutEffect(() => {
@@ -460,9 +668,12 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
     const heightDelta = el.scrollHeight - pending.previousHeight;
     el.scrollTop = pending.previousTop + heightDelta;
     pendingPrependAdjust.current = null;
-  }, [visibleStartIndex, posts.length]);
+  }, [visibleStartIndex, livePosts.length, progressMessages.length]);
 
-  // Thinking / waiting-for-response state
+  useEffect(() => {
+    setLivePosts(sortPostsChronologically(posts));
+  }, [posts]);
+
   const [thinking, setThinking] = useState(false);
   const [thinkingStart, setThinkingStart] = useState(0);
   const [nextPollIn, setNextPollIn] = useState(0);
@@ -470,8 +681,8 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const backoffStep = useRef(0);
 
-  const INITIAL_DELAY = 15_000; // 15s first check
-  const MAX_DELAY = 120_000;    // cap at 2 minutes
+  const INITIAL_DELAY = 15_000;
+  const MAX_DELAY = 120_000;
 
   const clearPolling = useCallback(() => {
     if (pollTimer.current) {
@@ -489,62 +700,68 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
 
     pollTimer.current = setTimeout(async () => {
       await refetchPosts();
-      // After refetch, the posts effect below will check if we got a response
-      // If no new posts, schedule next poll with increased backoff
       backoffStep.current += 1;
       scheduleNextPoll();
     }, delay);
   }, [refetchPosts]);
 
-  // Start thinking after user sends a message with an @mention
   const handleUserSent = useCallback((hasMention: boolean) => {
     refetchPosts();
     onTaskUpdate();
     if (hasMention) {
-      postCountAtSend.current = posts.length + 1; // +1 for the post the user just sent
+      postCountAtSend.current = livePosts.length + 1;
       setThinking(true);
       setThinkingStart(Date.now());
       backoffStep.current = 0;
       if (pollTimer.current) clearTimeout(pollTimer.current);
       scheduleNextPoll();
     }
-  }, [refetchPosts, onTaskUpdate, posts.length, scheduleNextPoll]);
+  }, [refetchPosts, onTaskUpdate, livePosts.length, scheduleNextPoll]);
 
-  // Stop thinking when we get new posts from someone other than "user"
   useEffect(() => {
     if (!thinking) return;
-    // Check if any post arrived after the user's send
-    if (posts.length > postCountAtSend.current) {
-      const newPosts = posts.slice(postCountAtSend.current);
+    if (livePosts.length > postCountAtSend.current) {
+      const newPosts = livePosts.slice(postCountAtSend.current);
       const hasAgentResponse = newPosts.some(p => p.authorId !== 'user');
       if (hasAgentResponse) {
         clearPolling();
       }
     }
-  }, [posts, thinking, clearPolling]);
+  }, [livePosts, thinking, clearPolling]);
 
-  // Clear thinking on SSE task events (agent responded via SSE)
   useEffect(() => {
-    if (!thinking || events.length === 0) return;
-    const lastEvent = events[events.length - 1];
+    if (!thinking || !lastEvent) return;
     if (lastEvent.type === 'task.completed' || lastEvent.type === 'task.failed') {
       clearPolling();
     }
-  }, [events, thinking, clearPolling]);
+  }, [lastEvent, thinking, clearPolling]);
 
-  // Clear polling on unmount or channel change
   useEffect(() => {
     return () => {
       if (pollTimer.current) clearTimeout(pollTimer.current);
     };
   }, [channelId]);
 
-  // Reset thinking when switching channels
   useEffect(() => {
     clearPolling();
-  }, [channelId, clearPolling]);
+    setLivePosts([]);
+    prevPostCount.current = 0;
+    setNewMessageCount(0);
+    isNearBottom.current = true;
+    setIsAtBottom(true);
+    requestAnimationFrame(() => scrollToBottom('auto'));
+  }, [channelId, clearPolling, scrollToBottom]);
 
-  // Window messages and jump to latest when channel changes
+  useEffect(() => {
+    if (!channelId) return;
+    requestAnimationFrame(() => scrollToBottom('auto'));
+  }, [channelId, channelScrollToken, scrollToBottom]);
+
+  useEffect(() => {
+    if (!channelId || !isAtBottom) return;
+    clearChannelUnread(channelId);
+  }, [channelId, isAtBottom, clearChannelUnread]);
+
   useEffect(() => {
     if (channelId === null) {
       lastChannelId.current = null;
@@ -556,10 +773,10 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
     const switchedChannel = lastChannelId.current !== channelId;
     if (!switchedChannel) return;
 
-    const start = Math.max(0, posts.length - INITIAL_VISIBLE_POSTS);
+    const start = Math.max(0, livePosts.length - INITIAL_VISIBLE_POSTS);
     setVisibleStartIndex(start);
     setNewMessageCount(0);
-    prevPostCount.current = posts.length;
+    prevPostCount.current = livePosts.length;
     lastChannelId.current = channelId;
 
     requestAnimationFrame(() => {
@@ -567,38 +784,35 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
       if (!el) return;
       el.scrollTop = el.scrollHeight;
       isNearBottom.current = true;
+      setIsAtBottom(true);
     });
-  }, [channelId, loading, posts.length, INITIAL_VISIBLE_POSTS]);
+  }, [channelId, loading, livePosts.length, INITIAL_VISIBLE_POSTS]);
 
   useEffect(() => {
-    setVisibleStartIndex(prev => Math.min(prev, Math.max(0, posts.length - 1)));
-  }, [posts.length]);
+    setVisibleStartIndex(prev => Math.min(prev, Math.max(0, livePosts.length - 1)));
+  }, [livePosts.length]);
 
-  // Smart auto-scroll: only scroll if user is near the bottom, otherwise count new messages
   useEffect(() => {
-    const threshold = 100;
-    const distanceFromBottom = getDistanceFromBottom();
-    const nearBottom = distanceFromBottom < threshold;
+    const nearBottom = getDistanceFromBottom() < 100;
+    const newCount = livePosts.length - prevPostCount.current;
 
-    const newCount = posts.length - prevPostCount.current;
     if (prevPostCount.current > 0 && newCount > 0) {
       if (nearBottom) {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        scrollToBottom();
       } else {
         setNewMessageCount(prev => prev + newCount);
       }
     }
 
     isNearBottom.current = nearBottom;
-    prevPostCount.current = posts.length;
-  }, [posts, getDistanceFromBottom]);
+    setIsAtBottom(nearBottom);
+    prevPostCount.current = livePosts.length;
+  }, [livePosts, getDistanceFromBottom, scrollToBottom]);
 
-  // Keep viewport pinned to the latest streamed chunk while already at the bottom
   useEffect(() => {
     if (!streamingAgentId || progressMessages.length === 0) return;
 
-    const threshold = 100;
-    const nearBottom = getDistanceFromBottom() < threshold;
+    const nearBottom = getDistanceFromBottom() < 100;
     if (!nearBottom && !isNearBottom.current) return;
 
     const el = messagesContainerRef.current;
@@ -606,55 +820,85 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
 
     el.scrollTop = el.scrollHeight;
     isNearBottom.current = true;
+    setIsAtBottom(true);
     setNewMessageCount(0);
   }, [progressMessages, streamingAgentId, getDistanceFromBottom]);
 
-  // Scroll to bottom when thinking indicator appears (user just sent)
   useEffect(() => {
     if (thinking && isNearBottom.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      scrollToBottom();
     }
-  }, [thinking]);
+  }, [thinking, scrollToBottom]);
 
-  // Refetch posts when SSE event arrives
   useEffect(() => {
-    if (events.length === 0) return;
-    const lastEvent = events[events.length - 1];
-    
-    // Handle task progress - accumulate streaming output
+    if (!lastEvent) return;
+
+    const payload = getEventPayload(lastEvent);
+    const eventChannelId = getEventChannelId(lastEvent);
+    const isActiveChannelEvent = !channelId || !eventChannelId || eventChannelId === channelId;
+
     if (lastEvent.type === 'task.progress') {
-      const { agentId, channelId, chunk } = lastEvent.payload || {};
-      if (agentId && channelId && chunk) {
-        addProgress({ agentId, channelId, chunk });
+      const agentId = typeof payload.agentId === 'string' ? payload.agentId : null;
+      const progressChannelId = typeof payload.channelId === 'string' ? payload.channelId : null;
+      const chunk = typeof payload.chunk === 'string' ? payload.chunk : null;
+      if (agentId && progressChannelId && chunk) {
+        addProgress({ agentId, channelId: progressChannelId, chunk });
       }
+      return;
     }
-    
-    // Handle task completion - clear progress and fetch final post
+
+    if (lastEvent.type === 'post.created' || lastEvent.type === 'post.updated') {
+      const eventPost = getEventPost(lastEvent);
+      if (eventPost && (!channelId || eventPost.channelId === channelId)) {
+        setLivePosts(prev => upsertPost(prev, eventPost));
+      } else if (isActiveChannelEvent) {
+        refetchPosts();
+      }
+      return;
+    }
+
+    if (lastEvent.type === 'channel.created' || lastEvent.type === 'channel.updated') {
+      if (isActiveChannelEvent) {
+        refetchPosts();
+      }
+      return;
+    }
+
     if (lastEvent.type === 'task.completed') {
-      const agentId = lastEvent.payload?.agentId;
+      const agentId = typeof payload.agentId === 'string' ? payload.agentId : undefined;
       clearProgress(agentId);
-      refetchPosts();
+      if (isActiveChannelEvent) {
+        refetchPosts();
+      }
       onTaskUpdate();
       const channelName = channel?.name || 'unknown';
       notifyAgentComplete(agentId || 'agent', channelName);
+      return;
     }
-    
-    // Handle task failure - clear progress and show error
+
     if (lastEvent.type === 'task.failed') {
-      const agentId = lastEvent.payload?.agentId;
+      const agentId = typeof payload.agentId === 'string' ? payload.agentId : undefined;
       clearProgress(agentId);
-      refetchPosts();
+      if (isActiveChannelEvent) {
+        refetchPosts();
+      }
       onTaskUpdate();
       const channelName = channel?.name || 'unknown';
-      const error = lastEvent.payload?.error;
+      const error = typeof payload.error === 'string' ? payload.error : undefined;
       notifyAgentFailed(agentId || 'agent', channelName, error);
+      return;
     }
-    
-    // Handle task started - clear any stale progress
+
     if (lastEvent.type === 'task.started') {
+      clearProgress();
+      onTaskUpdate();
+      return;
+    }
+
+    if (lastEvent.type === 'mention.updated') {
       onTaskUpdate();
     }
-  }, [events, refetchPosts, onTaskUpdate, channel, addProgress, clearProgress]);
+  }, [lastEvent, refetchPosts, onTaskUpdate, channel, channelId, addProgress, clearProgress]);
 
   return (
     <div className="main">
@@ -687,7 +931,7 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
               <div className="empty-state-title">welcome_to_hive //</div>
               <div className="empty-state-desc">Communicate with AI agents in real-time channels. Select a channel from the sidebar to get started.</div>
             </div>
-          ) : posts.length === 0 ? (
+          ) : livePosts.length === 0 ? (
             <div className="empty-state">
               <div className="empty-state-icon" style={{ fontSize: 32, opacity: 0.3 }}>#</div>
               <div className="empty-state-title">no_messages //</div>
@@ -695,7 +939,7 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
             </div>
           ) : (
             <>
-              {visiblePosts.map(post => (
+              {visibleLivePosts.map(post => (
                 <Message key={post.id} post={post} />
               ))}
               {progressMessages.map(msg => (
@@ -709,15 +953,17 @@ function Main({ channelId, onTaskUpdate }: { channelId: string | null; onTaskUpd
           )}
         </div>
 
-        {newMessageCount > 0 && (
-          <button className="new-messages-btn" onClick={scrollToBottom}>
-            {newMessageCount} new message{newMessageCount !== 1 ? 's' : ''} — click to scroll down
+        {(!isAtBottom || newMessageCount > 0) && (
+          <button className="new-messages-btn" onClick={() => scrollToBottom()}>
+            {newMessageCount > 0
+              ? `${newMessageCount} new message${newMessageCount !== 1 ? 's' : ''} - jump to latest`
+              : 'Jump to latest'}
           </button>
         )}
       </div>
 
       {channel && (
-        <Composer channelId={channel.id} posts={posts} onSend={handleUserSent} />
+        <Composer channelId={channel.id} posts={livePosts} onSend={handleUserSent} />
       )}
     </div>
   );

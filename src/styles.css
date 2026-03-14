@@ -498,6 +498,13 @@ body {
   white-space: nowrap;
 }
 
+.channel-unread-badge {
+  min-width: 24px;
+  padding: 0 7px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
 /* ========================================
    Badges & Status
    ======================================== */
@@ -1203,6 +1210,7 @@ body {
   bottom: 12px;
   left: 50%;
   transform: translateX(-50%);
+  min-width: 160px;
   padding: 8px 20px;
   background: var(--accent-orange);
   color: var(--text-on-accent);
@@ -1250,19 +1258,4 @@ body {
   height: 100%;
   background: var(--accent-orange);
   transition: width 0.3s ease;
-}
-
-/* ========================================
-   Sidebar Icon
-   ======================================== */
-
-.sidebar-item-icon {
-  width: 16px;
-  text-align: center;
-  color: inherit;
-  font-weight: 600;
-}
-
-.sidebar-item.active .sidebar-item-icon {
-  color: var(--accent-orange);
 }

@@ -10,6 +10,12 @@ export interface ProgressMessage {
   timestamp: number;
 }
 
+export interface HiveEvent {
+  type: string;
+  payload?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 // Channels hook
 export function useChannels() {
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -129,7 +135,8 @@ export function useMentions(agentId?: string) {
 
 // SSE hook for real-time events
 export function useSSE(url: string) {
-  const [events, setEvents] = useState<any[]>([]);
+  const [events, setEvents] = useState<HiveEvent[]>([]);
+  const [lastEvent, setLastEvent] = useState<HiveEvent | null>(null);
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
@@ -139,8 +146,9 @@ export function useSSE(url: string) {
     source.onerror = () => setConnected(false);
     source.onmessage = (e) => {
       try {
-        const event = JSON.parse(e.data);
+        const event = JSON.parse(e.data) as HiveEvent;
         setEvents(prev => [...prev.slice(-99), event]);
+        setLastEvent(event);
       } catch (err) {
         console.error('Failed to parse SSE event:', err);
       }
@@ -152,7 +160,7 @@ export function useSSE(url: string) {
     };
   }, [url]);
 
-  return { events, connected };
+  return { events, lastEvent, connected };
 }
 
 // Combined hook for channel view
@@ -170,7 +178,6 @@ export function useChannel(channelId: string | null) {
     refetchPosts,
   };
 }
-
 // Hook for managing streaming progress messages
 export function useProgress(channelId: string | null) {
   const [progressMessages, setProgressMessages] = useState<ProgressMessage[]>([]);
